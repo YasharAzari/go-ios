@@ -1,9 +1,14 @@
 package forward
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/danielpaulus/go-ios/ios"
 	log "github.com/sirupsen/logrus"
@@ -30,6 +35,7 @@ func Forward(device ios.DeviceEntry, hostPort uint16, phonePort uint16) error {
 }
 
 func connectionAccept(l net.Listener, deviceID int, phonePort uint16) {
+	var openConnectionCounter int64
 	for {
 		clientConn, err := l.Accept()
 		if err != nil {
@@ -37,33 +43,51 @@ func connectionAccept(l net.Listener, deviceID int, phonePort uint16) {
 			continue
 		}
 		log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn)}).Info("new client connected")
-		go startNewProxyConnection(clientConn, deviceID, phonePort)
+		go startNewProxyConnection(clientConn, deviceID, phonePort, &openConnectionCounter)
 	}
 }
 
-func startNewProxyConnection(clientConn net.Conn, deviceID int, phonePort uint16) {
+func startNewProxyConnection(clientConn net.Conn, deviceID int, phonePort uint16, openConnectionCounter *int64) {
+	defer clientConn.Close()
 	usbmuxConn, err := ios.NewUsbMuxConnectionSimple()
 	if err != nil {
 		log.Errorf("could not connect to usbmuxd: %+v", err)
-		clientConn.Close()
 		return
 	}
 	muxError := usbmuxConn.Connect(deviceID, phonePort)
 	if muxError != nil {
 		log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "err": muxError, "phonePort": phonePort}).Infof("could not connect to phone")
-		clientConn.Close()
 		return
 	}
-	log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "phonePort": phonePort}).Infof("Connected to port")
+	atomic.AddInt64(openConnectionCounter, 1)
+	//log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "phonePort": phonePort, "totalOpenConnection": openConnectionCounter}).Infof("Connected to port")
 	deviceConn := usbmuxConn.ReleaseDeviceConnection()
+	defer deviceConn.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	//proxyConn := iosproxy{clientConn, deviceConn}
+	buff := bytes.Buffer{}
+	r := io.TeeReader(clientConn, &buff)
+	var request string
 	go func() {
+		defer wg.Done()
+		time.Sleep(500 * time.Millisecond)
+		out, _ := ioutil.ReadAll(&buff)
+		log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "phonePort": phonePort, "totalOpenConnection": openConnectionCounter, "request": string(out)}).Infof("Connected to port")
+	}()
+	go func() {
+		//writing device response to client
+		defer wg.Done()
 		io.Copy(clientConn, deviceConn.Reader())
 	}()
 	go func() {
-		io.Copy(deviceConn.Writer(), clientConn)
+		//writing client request to device
+		io.Copy(deviceConn.Writer(), r)
 	}()
+	wg.Wait()
+
+	log.WithFields(log.Fields{"conn": fmt.Sprintf("%#v", clientConn), "phonePort": phonePort, "request": request}).Infof("Closing connection to port")
+	atomic.AddInt64(openConnectionCounter, -1)
 }
 
 func (proxyConn *iosproxy) Close() {
